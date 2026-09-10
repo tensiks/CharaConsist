@@ -3,7 +3,7 @@ parser = argparse.ArgumentParser(description='')
 parser.add_argument("--init_mode", type=int, choices=[0, 1, 2, 3], default=0)
 parser.add_argument('--gpu_ids', type=int, nargs='+', default=[0, 1])
 parser.add_argument("--prompts_file", type=str, default="")
-parser.add_argument("--model_path", type=str, default="/path/to/FLUX.1-dev")
+parser.add_argument("--model_path", type=str, default="/home/hirushika/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-dev/snapshots/3de623fc3c33e44ffbe2bad470d0f45bccf2eb21")
 parser.add_argument("--out_dir", type=str, default="results")
 parser.add_argument("--use_interpolate", action='store_true')
 parser.add_argument("--share_bg", action='store_true')
@@ -11,10 +11,14 @@ parser.add_argument("--save_mask", action='store_true')
 parser.add_argument("--height", type=int, default=1024)
 parser.add_argument("--width", type=int, default=1024)
 parser.add_argument("--seed", type=int, default=2025)
+parser.add_argument("--prompt_group", type=int, default=None, help=argparse.SUPPRESS)
 args = parser.parse_args()
 
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, args.gpu_ids))
+import gc
+import subprocess
+import sys
 import torch
 import numpy as np
 
@@ -25,6 +29,29 @@ from models.attention_processor_characonsist import (
     reset_id_bank,
 )
 from models.pipeline_characonsist import CharaConsistPipeline
+
+
+def clear_memory():
+    """Release unused Python and CUDA allocations between generations."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
+def move_spatial_kwargs_to_cpu(spatial_kwargs):
+    """Keep state needed by the next frame off the GPU between calls."""
+    for key, value in spatial_kwargs.items():
+        if torch.is_tensor(value) and value.is_cuda:
+            spatial_kwargs[key] = value.cpu()
+
+
+def clear_frame_state(spatial_kwargs):
+    """Drop frame-specific tensors after their image has been written."""
+    for key in ("id_fg_inds", "curr_fg_inds", "max_sim", "argmax_indices"):
+        spatial_kwargs.pop(key, None)
+    move_spatial_kwargs_to_cpu(spatial_kwargs)
 
 
 def init_model_mode_0():
@@ -64,6 +91,12 @@ MODEL_INIT_FUNCS = {
     2: init_model_mode_2,
     3: init_model_mode_3
 }
+
+
+def initialize_pipeline():
+    pipe = MODEL_INIT_FUNCS[args.init_mode]()
+    reset_attn_processor(pipe, size=(args.height//16, args.width//16))
+    return pipe
 
 def get_text_tokens_length(pipe, p):
     text_mask = pipe.tokenizer_2(
@@ -122,11 +155,26 @@ def overlay_mask_on_image(image, mask, color, output_path):
 
 
 if __name__ == "__main__":
+    if args.prompt_group is None:
+        with open(args.prompts_file, "r") as prompt_file:
+            group_count = sum(1 for line in prompt_file if not line.strip())
+        with open(args.prompts_file, "r") as prompt_file:
+            if prompt_file.read().strip():
+                group_count += 1
+
+        child_args = [arg for arg in sys.argv[1:] if arg != "--prompt_group"]
+        for prompt_group in range(group_count):
+            subprocess.run(
+                [sys.executable, __file__, *child_args, "--prompt_group", str(prompt_group)],
+                check=True,
+            )
+        raise SystemExit(0)
+
     # Model Init
-    pipe = MODEL_INIT_FUNCS[args.init_mode]()
-    reset_attn_processor(pipe, size=(args.height//16, args.width//16))
+    pipe = initialize_pipeline()
     # Load prompts
     all_prompt_info = load_prompt_file(pipe, args.prompts_file)
+    all_prompt_info = [all_prompt_info[args.prompt_group]]
     
     pipe_kwargs = dict(
         height = args.height,
@@ -135,7 +183,8 @@ if __name__ == "__main__":
         share_bg = args.share_bg
     )
 
-    for prompt_ind, (prompts, bg_lens, real_lens) in enumerate(all_prompt_info):
+    for prompts, bg_lens, real_lens in all_prompt_info:
+        prompt_ind = args.prompt_group
         out_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}")
         os.makedirs(out_dir, exist_ok=True)
         if args.save_mask:
@@ -154,6 +203,9 @@ if __name__ == "__main__":
         id_images[0].save(f"{out_dir}/id.jpg")
         if args.save_mask:
             overlay_mask_on_image(id_images[0], id_fg_mask[0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/id_mask.jpg")
+        del id_images, id_spatial_kwargs
+        id_fg_mask = id_fg_mask.cpu()
+        clear_memory()
 
         # Frame Gen
         spatial_kwargs = dict(id_fg_mask = id_fg_mask, id_bg_mask = ~id_fg_mask)
@@ -164,9 +216,17 @@ if __name__ == "__main__":
             pre_images, spatial_kwargs = pipe(
                 prompt, is_pre_run=True, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs) 
             pre_images[0].save(f"{out_dir}/{ind}_pre.jpg")       
+            del pre_images
+            move_spatial_kwargs_to_cpu(spatial_kwargs)
+            clear_memory()
             images, spatial_kwargs = pipe(
                 prompt, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs)
             images[0].save(f"{out_dir}/{ind}.jpg")
             if args.save_mask:
                 overlay_mask_on_image(images[0], spatial_kwargs["curr_fg_mask"][0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/{ind}_mask.jpg")
+            del images
+            clear_frame_state(spatial_kwargs)
+            clear_memory()
         reset_id_bank(pipe)
+        del spatial_kwargs, id_fg_mask
+        clear_memory()

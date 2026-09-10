@@ -238,11 +238,14 @@ class CharaConsistAttnProcessor2_0:
     
     def ada_tome(self, hidden_states, timestep_ind, alpha, id_fg_inds=None, curr_fg_inds=None, max_sim=None, **kwargs):
         id_hidden_states = self.id_attn_bank[timestep_ind]["attn_out"].to(hidden_states.device, non_blocking=True)
+        id_fg_inds = id_fg_inds.to(hidden_states.device, non_blocking=True)
+        curr_fg_inds = curr_fg_inds.to(hidden_states.device, non_blocking=True)
+        max_sim = max_sim.to(hidden_states.device, non_blocking=True)
         vision_hidden_states = hidden_states[:, self.text_seq_len:, :]
         matched_id_hidden_states = id_hidden_states[:, id_fg_inds]
         matched_curr_hidden_states = vision_hidden_states[:, curr_fg_inds]
 
-        alpha_tensor = torch.ones_like(curr_fg_inds, dtype=torch.bfloat16)
+        alpha_tensor = torch.ones_like(curr_fg_inds, dtype=hidden_states.dtype)
         alpha_tensor = alpha_tensor * alpha
         sim_weight = max_sim.flatten()[curr_fg_inds]
         alpha_tensor = alpha_tensor * sim_weight

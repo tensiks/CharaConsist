@@ -32,7 +32,7 @@ def get_shared_fg_mask(id_fg_mask, curr_fg_mask, curr2id_argmax_indices, curr2id
     rearrange_id_fg_mask = id_fg_mask[curr2id_argmax_indices[0]]
     share_fg_mask = curr_fg_mask & rearrange_id_fg_mask & curr_valid_mask
     id_share_fg_indices = curr2id_argmax_indices[0][share_fg_mask]
-    curr_share_fg_indices = torch.nonzero(share_fg_mask).squeeze()
+    curr_share_fg_indices = torch.nonzero(share_fg_mask, as_tuple=True)[0]
     return id_share_fg_indices, curr_share_fg_indices
 
 

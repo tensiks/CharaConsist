@@ -196,36 +196,45 @@ class CharaConsistAttnProcessor2_0:
             assert id_bg_mask is not None
             id_bg_mask = id_bg_mask.flatten().to(device, non_blocking=True)
             shared_bg = (id_bg_mask & (~curr_fg_mask))
-            if "updated_key" in self.id_attn_bank[timestep_ind]:
-                saved_key = self.id_attn_bank[timestep_ind]["updated_key"].to(device, non_blocking=True)[:, :, shared_bg]
-                saved_value = self.id_attn_bank[timestep_ind]["updated_value"].to(device, non_blocking=True)[:, :, shared_bg]
+            if shared_bg.any():
+                if "updated_key" in self.id_attn_bank[timestep_ind]:
+                    saved_key = self.id_attn_bank[timestep_ind]["updated_key"].to(device, non_blocking=True)[:, :, shared_bg]
+                    saved_value = self.id_attn_bank[timestep_ind]["updated_value"].to(device, non_blocking=True)[:, :, shared_bg]
+                else:
+                    saved_key = ori_saved_key[:, :, shared_bg]
+                    saved_value = ori_saved_value[:, :, shared_bg]
+                image_rotary_emb_bg = (
+                    image_rotary_emb[0][shared_bg],
+                    image_rotary_emb[1][shared_bg],
+                )
+                saved_key = apply_rotary_emb(saved_key, image_rotary_emb_bg)
+                id_fg_mask = torch.zeros([saved_key.shape[2]], device=device, dtype=torch.bool)
             else:
-                saved_key = ori_saved_key[:, :, shared_bg]
-                saved_value = ori_saved_value[:, :, shared_bg]
-            image_rotary_emb_bg = (
-                image_rotary_emb[0][shared_bg],
-                image_rotary_emb[1][shared_bg],
-            )
-            saved_key = apply_rotary_emb(saved_key, image_rotary_emb_bg)
-            id_fg_mask = torch.zeros([saved_key.shape[2]], device=device, dtype=torch.bool)
+                bg_share_flag = False
         
         if fg_share_flag:
-            saved_key_fg = ori_saved_key[:, :, id_fg_inds]
-            saved_value_fg = ori_saved_value[:, :, id_fg_inds]
-            image_rotary_emb_fg = (
-                image_rotary_emb[0][curr_fg_inds],
-                image_rotary_emb[1][curr_fg_inds],
-            )
-            saved_key_fg = apply_rotary_emb(saved_key_fg, image_rotary_emb_fg)
-            if saved_key is not None:
-                saved_key = torch.cat([saved_key, saved_key_fg], dim=2)
-                saved_value = torch.cat([saved_value, saved_value_fg], dim=2)
-                id_fg_mask = torch.zeros([saved_key.shape[2]], device=device, dtype=torch.bool)
-                id_fg_mask[-saved_key_fg.shape[2]:] = True
+            if id_fg_inds is not None and id_fg_inds.numel() > 0:
+                saved_key_fg = ori_saved_key[:, :, id_fg_inds]
+                saved_value_fg = ori_saved_value[:, :, id_fg_inds]
+                image_rotary_emb_fg = (
+                    image_rotary_emb[0][curr_fg_inds],
+                    image_rotary_emb[1][curr_fg_inds],
+                )
+                saved_key_fg = apply_rotary_emb(saved_key_fg, image_rotary_emb_fg)
+                if saved_key is not None:
+                    saved_key = torch.cat([saved_key, saved_key_fg], dim=2)
+                    saved_value = torch.cat([saved_value, saved_value_fg], dim=2)
+                    id_fg_mask = torch.zeros([saved_key.shape[2]], device=device, dtype=torch.bool)
+                    id_fg_mask[-saved_key_fg.shape[2]:] = True
+                else:
+                    saved_key = saved_key_fg
+                    saved_value = saved_value_fg
+                    id_fg_mask = torch.ones([saved_key.shape[2]], device=device, dtype=torch.bool)
             else:
-                saved_key = saved_key_fg
-                saved_value = saved_value_fg
-                id_fg_mask = torch.ones([saved_key.shape[2]], device=device, dtype=torch.bool)
+                fg_share_flag = False
+
+        if saved_key is None:
+            return None, None, None
         
         expand_mask= self.get_expand_attn_mask(
             id_fg_mask, curr_fg_mask, bg_share_flag, fg_share_flag, device=device)
@@ -355,8 +364,11 @@ class CharaConsistAttnProcessor2_0:
                 timestep_ind,
                 query.device,
                 **spatial_kwargs)
-            key = torch.cat([key, saved_key], dim=2)
-            value = torch.cat([value, saved_value], dim=2)
+            if saved_key is not None:
+                key = torch.cat([key, saved_key], dim=2)
+                value = torch.cat([value, saved_value], dim=2)
+            else:
+                attention_mask = None
 
         hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
